@@ -1,0 +1,359 @@
+---
+- name: Install Java 11 from source
+  hosts: all
+  become: yes
+
+  vars:
+    java_version: "11.0.13"
+
+  tasks:
+    - name: Download Java source tarball
+      get_url:
+        url: "https://download.java.net/openjdk/jdk{{ java_version.major }}u{{ java_version.minor }}-b{{ java_version.build }}/openjdk-{{ java_version }}_linux-x64_bin.tar.gz"
+        dest: "/tmp/openjdk-{{ java_version }}_linux-x64_bin.tar.gz"
+
+    - name: Extract Java source tarball
+      unarchive:
+        src: "/tmp/openjdk-{{ java_version }}_linux-x64_bin.tar.gz"
+        dest: "/opt"
+        remote_src: yes
+        copy: no
+
+    - name: Set Java environment variables
+      become_user: root
+      become_method: su
+      lineinfile:
+        dest: "/etc/profile"
+        line: |
+          export JAVA_HOME=/opt/jdk-{{ java_version }}
+          export PATH=$PATH:$JAVA_HOME/bin
+      register: set_java_env
+
+    - name: Reload environment variables
+      become_user: root
+      become_method: su
+      shell: "source /etc/profile"
+      when: set_java_env.changed
+
+
+---
+- name: Install RPM packages offline
+  hosts: all
+  become: yes
+
+  vars:
+    rpm_packages:
+      - /path/to/package1.rpm
+      - /path/to/package2.rpm
+      - /path/to/package3.rpm
+
+  tasks:
+    - name: Copy RPM packages to target server(s)
+      copy:
+        src: "{{ item }}"
+        dest: "/tmp/"
+      with_items:
+        - "{{ rpm_packages }}"
+
+    - name: Install RPM packages
+      yum:
+        name: "{{ item }}"
+        state: present
+        disablerepo: "*"
+        enablerepo: "local"
+      with_items:
+        - "{{ rpm_packages | map('basename') | map('replace','.rpm','') | list }}"
+
+    - name: Remove RPM packages from target server(s)
+      file:
+        path: "/tmp/{{ item }}"
+        state: absent
+      with_items:
+        - "{{ rpm_packages | map('basename') | list }}"
+
+---
+- name: Setup MariaDB replication from offline binary source
+  hosts: primary
+  become: yes
+
+  vars:
+    mariadb_version: "10.6.5"
+    mariadb_tarball: "/path/to/mariadb-{{ mariadb_version }}.tar.gz"
+    mariadb_install_dir: "/opt/mariadb-{{ mariadb_version }}"
+    mariadb_replication_user: "replication"
+    mariadb_replication_password: "replication_password"
+    mariadb_server_id: "{{ inventory_hostname | hash('djb2') }}"
+    mariadb_master_host: "192.168.1.10"
+    mariadb_master_user: "replication"
+    mariadb_master_password: "replication_password"
+    mariadb_master_log_file: "mysql-bin.000001"
+    mariadb_master_log_pos: "107"
+
+  tasks:
+    - name: Extract MariaDB tarball
+      unarchive:
+        src: "{{ mariadb_tarball }}"
+        dest: "{{ mariadb_install_dir }}"
+        remote_src: yes
+        copy: no
+        creates: "{{ mariadb_install_dir }}/bin/mysql"
+
+    - name: Initialize MariaDB data directory
+      command: "{{ mariadb_install_dir }}/bin/mysqld --initialize-insecure --datadir={{ mariadb_install_dir }}/data"
+
+    - name: Start MariaDB service
+      service:
+        name: mariadb
+        state: started
+
+    - name: Create replication user
+      mysql_user:
+        name: "{{ mariadb_replication_user }}"
+        password: "{{ mariadb_replication_password }}"
+        priv: "*.*:REPLICATION SLAVE"
+        host: "%"
+        login_user: root
+        login_password: ""
+        state: present
+
+    - name: Get replication log file and position from master
+      mysql_replication:
+        mode: getmaster
+        login_host: "{{ mariadb_master_host }}"
+        login_user: "{{ mariadb_master_user }}"
+        login_password: "{{ mariadb_master_password }}"
+      register: replication_status
+
+    - name: Set replication master configuration
+      mysql_replication:
+        mode: changemaster
+        login_host: "{{ inventory_hostname }}"
+        login_user: "{{ mariadb_replication_user }}"
+        login_password: "{{ mariadb_replication_password }}"
+        master_host: "{{ mariadb_master_host }}"
+        master_user: "{{ mariadb_master_user }}"
+        master_password: "{{ mariadb_master_password }}"
+        master_log_file: "{{ replication_status.Master_Log_File }}"
+        master_log_pos: "{{ replication_status.Read_Master_Log_Pos }}"
+      when: replication_status is defined
+
+    - name: Enable MariaDB binary logging
+      mysql_global_variables:
+        name: log_bin
+        value: "ON"
+        login_user: root
+        login_password: ""
+      register: log_bin_status
+
+    - name: Set MariaDB server ID
+      mysql_global_variables:
+        name: server_id
+        value: "{{ mariadb_server_id }}"
+        login_user: root
+        login_password: ""
+      when: log_bin_status is defined
+
+---
+- name: Install Apache ActiveMQ Artemis cluster from binary files
+  hosts: all
+  become: true
+  vars:
+    artemis_version: "2.18.0"
+    artemis_binary_file: "apache-artemis-{{ artemis_version }}-bin.tar.gz"
+    artemis_install_dir: "/opt/artemis"
+    artemis_cluster_name: "my_cluster"
+    artemis_node1_ip: "192.168.1.10"
+    artemis_node2_ip: "192.168.1.11"
+  tasks:
+    - name: Create Artemis installation directory
+      file:
+        path: "{{ artemis_install_dir }}"
+        state: directory
+
+    - name: Copy Artemis binary file to remote hosts
+      copy:
+        src: "{{ playbook_dir }}/files/{{ artemis_binary_file }}"
+        dest: "/tmp/{{ artemis_binary_file }}"
+
+    - name: Extract Artemis binary file
+      unarchive:
+        src: "/tmp/{{ artemis_binary_file }}"
+        dest: "{{ artemis_install_dir }}"
+        copy: no
+        remote_src: yes
+
+    - name: Configure Artemis cluster on node1
+      template:
+        src: "{{ playbook_dir }}/templates/artemis-node1.xml.j2"
+        dest: "{{ artemis_install_dir }}/node1/etc/broker.xml"
+        mode: 0644
+      vars:
+        artemis_node_ip: "{{ artemis_node1_ip }}"
+        artemis_cluster_connector: "static:tcp://{{ artemis_node1_ip }}:61616,tcp://{{ artemis_node2_ip }}:61616"
+        artemis_cluster_backups: "{{ artemis_node2_ip }}"
+        artemis_cluster_name: "{{ artemis_cluster_name }}"
+
+    - name: Configure Artemis cluster on node2
+      template:
+        src: "{{ playbook_dir }}/templates/artemis-node2.xml.j2"
+        dest: "{{ artemis_install_dir }}/node2/etc/broker.xml"
+        mode: 0644
+      vars:
+        artemis_node_ip: "{{ artemis_node2_ip }}"
+        artemis_cluster_connector: "static:tcp://{{ artemis_node2_ip }}:61616,tcp://{{ artemis_node1_ip }}:61616"
+        artemis_cluster_backups: "{{ artemis_node1_ip }}"
+        artemis_cluster_name: "{{ artemis_cluster_name }}"
+
+    - name: Start Artemis cluster on node1
+      command: "{{ artemis_install_dir }}/node1/bin/artemis-service start"
+      async: 0
+      poll: 0
+      become: true
+      ignore_errors: yes
+
+    - name: Start Artemis cluster on node2
+      command: "{{ artemis_install_dir }}/node2/bin/artemis-service start"
+      async: 0
+      poll: 0
+      become: true
+      ignore_errors: yes
+
+
+
+<configuration xmlns="urn:activemq" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="urn:activemq /schema/artemis-server.xsd">
+  <core xmlns="urn:activemq:core" xsi:schemaLocation="urn:activemq:core ">
+    <name>{{ artemis_cluster_name }}-node2</name>
+    <persistence-enabled>true</persistence-enabled>
+    <journal-type>ASYNCIO</journal-type>
+    <paging-directory>${artemis.instance}/data/paging</paging-directory>
+    <bindings-directory>${artemis.instance}/data/bindings</bindings-directory>
+    <journal-directory>${artemis.instance}/data/journal</journal-directory>
+    <large-messages-directory>${artemis.instance}/data/large-messages</large-messages-directory>
+    <connectors>
+      <connector name="netty-connector">tcp://{{ artemis_node_ip }}:61616</connector>
+    </connectors>
+    <acceptors>
+      <acceptor name="netty-acceptor">tcp://{{ artemis_node_ip }}:61616?tcpSendBufferSize=1048576;tcpReceiveBufferSize=1048576;protocols=CORE,AMQP,STOMP,HORNETQ,MQTT,OPENWIRE</acceptor>
+    </acceptors>
+    <cluster-connections>
+      <cluster-connection name="my-cluster">
+        <address>jms</address>
+        <connector-ref>netty-connector</connector-ref>
+        <static-connectors>{{ artemis_cluster_connector }}</static-connectors>
+        <retry-interval>500</retry-interval>
+        <retry-interval-multiplier>1.0</retry-interval-multiplier>
+        <max-retry-interval>5000</max-retry-interval>
+        <initial-connect-attempts>-1</initial-connect-attempts>
+        <reconnect-attempts>-1</reconnect-attempts>
+        <call-timeout>30000</call-timeout>
+        <notification-interval>1000</notification-interval>
+        <message-load-balancing>ON_DEMAND</message-load-balancing>
+        <max-hops>1</max-hops>
+        <confirmation-window-size>1024</confirmation-window-size>
+        <allow-direct-packets>false</allow-direct-packets>
+      </cluster-connection>
+    </cluster-connections>
+    <ha-policy>
+      <replication>
+        <master>
+          <check-for-live-server>true</check-for-live-server>
+        </master>
+      </replication>
+    </ha-policy>
+    <backup>
+      <shared-store>
+        <master>
+          <failover-on-shutdown>true</failover-on-shutdown>
+        </master>
+        <slave>
+          <allow-failback>true</allow-failback>
+          <failback-delay>5000</failback-delay>
+          <max-saved-replicated-journals-size>100</max-saved-replicated-journals-size>
+        </slave>
+      </shared-store>
+    </backup>
+    <cluster-configuration>
+      <name>{{ artemis_cluster_name }}</name>
+      <max-hops>1</max-hops>
+      <confirmation-window-size>1024</confirmation-window-size>
+      <address-setting match="#">
+        <default-exclusive-queue>true</default-exclusive-queue>
+        <redistribution-delay>1000</redistribution-delay>
+        <max-size-bytes>10485760</max-size-bytes>
+       
+    <page-size-bytes>2097152</page-size-bytes>
+    <max-delivery-attempts>10</max-delivery-attempts>
+    <max-size-bytes-reject-threshold>10485760</max-size-bytes-reject-threshold>
+    <dead-letter-address>DLQ</dead-letter-address>
+    <expiry-address>ExpiryQueue</expiry-address>
+    <redistribution-delay-multiplier>2</redistribution-delay-multiplier>
+    <redistribution-multiplier>1</redistribution-multiplier>
+  </address-setting>
+</cluster-configuration>
+</core>
+</configuration>
+
+
+<configuration xmlns="urn:activemq:core">
+  <core xmlns="urn:activemq:core" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="urn:activemq:core ">
+    <name>artemis</name>
+    <persistence-enabled>true</persistence-enabled>
+    <journal-type>NIO</journal-type>
+    <paging-directory>data/paging</paging-directory>
+    <bindings-directory>data/bindings</bindings-directory>
+    <journal-directory>data/journal</journal-directory>
+    <large-messages-directory>data/large-messages</large-messages-directory>
+    <journal-datasync>true</journal-datasync>
+    <journal-min-files>2</journal-min-files>
+    <journal-pool-files>10</journal-pool-files>
+    <journal-file-size>10M</journal-file-size>
+    <journal-buffer-timeout>2000</journal-buffer-timeout>
+    <journal-max-io>4096</journal-max-io>
+    <disk-scan-period>5000</disk-scan-period>
+    <max-disk-usage>90</max-disk-usage>
+    <critical-analyzer>true</critical-analyzer>
+    <critical-analyzer-timeout>120000</critical-analyzer-timeout>
+    <critical-analyzer-check-period>60000</critical-analyzer-check-period>
+    <critical-analyzer-policy>HALT</critical-analyzer-policy>
+    <page-sync-timeout>1628000</page-sync-timeout>
+    <global-max-size>100Mb</global-max-size>
+    <connectors>
+      <connector name="netty-connector">tcp://{{ artemis_node_ip }}:61616</connector>
+    </connectors>
+    <acceptors>
+      <acceptor name="netty-acceptor">tcp://0.0.0.0:61616</acceptor>
+    </acceptors>
+    <security-settings>
+      <security-setting match="#">
+        <permission type="createDurableQueue" roles="amq"/>
+        <permission type="deleteDurableQueue" roles="amq"/>
+        <permission type="createNonDurableQueue" roles="amq"/>
+        <permission type="deleteNonDurableQueue" roles="amq"/>
+        <permission type="send" roles="amq"/>
+        <permission type="consume" roles="amq"/>
+      </security-setting>
+    </security-settings>
+    <address-settings>
+      <address-setting match="#">
+        <dead-letter-address>DLQ</dead-letter-address>
+        <expiry-address>ExpiryQueue</expiry-address>
+        <redistribution-delay-multiplier>2</redistribution-delay-multiplier>
+        <redistribution-multiplier>1</redistribution-multiplier>
+      </address-setting>
+    </address-settings>
+    <cluster-connections>
+      <cluster-connection name="{{ artemis_cluster_name }}">
+        <connector-ref>netty-connector</connector-ref>
+        <retry-interval>500</retry-interval>
+        <use-duplicate-detection>true</use-duplicate-detection>
+        <message-load-balancing>ON_DEMAND</message-load-balancing>
+        <max-hops>1</max-hops>
+        <discovery-group-ref discovery-group-name="artemis-discovery-group"/>
+      </cluster-connection>
+    </cluster-connections>
+  </core>
+</configuration>
+
+
+
+
